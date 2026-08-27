@@ -5,8 +5,13 @@
 
 ## Features
 
-- Adds **Guard & Jail Manager** to Modding Tools' inventory **Mods** tab.
-- Designates any currently loaded base or custom `NeuralNPC` as a guard.
+- Adds a large, resolution-aware **Guard & Jail Manager** to Modding Tools'
+  inventory **Mods** tab. It scales by screen height, fits itself within narrow
+  displays, and uses auto-sized labels to avoid clipped controls.
+- Opens NPC guard designations in a separate searchable, scrollable interface.
+  It shows all currently loaded base and custom `NeuralNPC`s in a responsive
+  one-, two-, or three-column roster, can filter guards or civilians, and
+  toggles each NPC directly from the list.
 - Dispatches the closest loaded designated guard to the player's incident tile
   when an NPC invokes `call_guards`, instead of hard-coding Darian as the only
   responder.
@@ -23,20 +28,60 @@
 - Preserves Darian's AI-driven **let go without a fine** outcome and gives
   custom designated guards an equivalent function. A guard may use it when
   genuinely persuaded that the player committed no crime.
-- Toggles any loaded door as a jail door by clicking it in the world.
-- Selects the exact passable world tile used as the jail teleport destination.
+- Supports any number of independent jail cells. Each cell has its own exact
+  teleport destination and its own connected set of doors. The selected cell
+  is preferred for a new prisoner; if it is unavailable, the first configured,
+  loaded, unoccupied cell is used. Cell selection is never random.
+- Adds, cycles, and safely removes jail cells from the manager. A cell cannot
+  be removed while occupied or while one of its connected doors is unloaded.
+- Connects or disconnects a loaded door from the currently selected jail cell
+  by clicking it in the world. A door can belong to only one cell.
+- Can designate the player as a guard. Every normal NPC conversation then
+  receives **Guard: Accuse of Lawbreaking** in its action menu.
+- The player writes the alleged law and the accused NPC responds naturally in
+  the continuing conversation. The accusation action is then replaced by
+  **Guard: Decide Punishment**, allowing the player to keep questioning the NPC
+  before choosing an outcome.
+- Locks the conversation's **Leave** action while an accusation awaits a legal
+  outcome. Fining or jailing ends the case; releasing every accused NPC unlocks
+  Leave and continues the conversation with a response to the release.
+- In multi-NPC dialogue, the player selects one or more defendants before
+  writing the law. Every selected NPC responds in sequence, and the punishment
+  screen supports an independent Fine, Jail, or Release outcome for each one.
+  Selecting Fine charges the NPC immediately without an affordability check;
+  NPC imprisonment happens only when the player explicitly selects Jail.
+- Law entry uses the active conversation's Talk field, keeping the prompt
+  visible while the NPC dialogue is open instead of opening Silverpine's hidden
+  generic text-entry window after the conversation ends.
+- Jailed NPCs are teleported into their assigned cell, have their previous
+  routine stack halted, and are held by a dedicated jail routine. New override
+  routines are rejected until their independently tracked sentence expires.
+- A guard-enabled player can use **Guard: Release Prisoner Early** while
+  speaking with a jailed NPC. Multi-NPC conversations provide a named release
+  action for each prisoner. Early release restores normal routines immediately
+  and opens the cell when it is no longer occupied.
 - Converts the fine into jail time using a configurable gold-per-hour rate, or
   allows a configurable fixed sentence instead. It closes and locks every
   designated jail door for the resulting sentence, then unlocks and opens the
   doors automatically.
-- Suppresses the base door `publicAccess` exception during an active sentence,
-  so the jail cannot be opened from either side until release.
+- Suppresses the base door `publicAccess` exception during an active sentence.
+  Prisoners and civilians cannot open the cell from either side, while a
+  guard-enabled player can open it; the door closes and locks after the guard
+  passes through and clears the doorway.
 - Immediately ends and cleans up the responding guard conversation when the
   player accepts jail.
-- Stores guard, jail-door, jail-tile, fine, sentence, and active-sentence state
-  per save.
+- Does not broadcast the initial accusation or guard call as a rumor. It also
+  suppresses Silverpine's automatic conversation rumor for justice resolutions.
+  One explicit Silverpine-wide outcome rumor is created only when the player or
+  an NPC is actually fined or jailed; an innocent release creates no rumor.
+- Stores NPC/player guard designations, independent cell destinations and door
+  links, fine settings, and player/NPC active sentences per save.
 - Ignores `SaveUI`'s placeholder main-menu run ID, so opening or quitting from
-  the main menu does not create a phantom save configuration.
+  the main menu does not create a phantom save configuration, including during
+  the early startup frames before `MainMenuUI` exists. Version 1.1 performs a
+  one-time cleanup of untouched legacy entries only when their IDs cannot be
+  found in any real Silverpine save, preserving default configurations that do
+  belong to actual saves.
 - Keeps its runtime service alive across menu/scene transitions and does not
   tear down Harmony patches from `OnDestroy`.
 

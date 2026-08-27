@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -19,11 +20,11 @@ namespace SilverpineGuardSystem;
 [BepInDependency(
     Silverpine.ModdingTools.Plugin.PluginGuid,
     BepInDependency.DependencyFlags.HardDependency)]
-public sealed class Plugin : BaseUnityPlugin
+public sealed partial class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "renegadex.silverpine.guardsystem";
     public const string PluginName = "Silverpine Guard System";
-    public const string PluginVersion = "1.0.6";
+    public const string PluginVersion = "1.3.3";
 
     private static readonly FieldInfo RunIdField =
         AccessTools.Field(typeof(SaveUI), "runID");
@@ -46,6 +47,12 @@ public sealed class Plugin : BaseUnityPlugin
     private NeuralNPC? activeJusticeGuard;
     private Task? fineOrJailOfferTask;
     private int activePromptFineAmount = 100;
+    private readonly Dictionary<string, GuardIncident> pendingGuardIncidents =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> suppressedDialogRumorKeys =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> playerGuardOpenedJailDoorKeys =
+        new(StringComparer.OrdinalIgnoreCase);
 
     internal bool HasActiveSave => currentSave != null;
 
@@ -115,7 +122,7 @@ public sealed class Plugin : BaseUnityPlugin
 
     internal void RefreshSaveIdentity(bool force = false)
     {
-        if (MainMenuUI.Instance != null && MainMenuUI.Instance.IsOpen())
+        if (MainMenuUI.Instance == null || MainMenuUI.Instance.IsOpen())
         {
             currentRunId = "";
             currentSave = null;
@@ -328,6 +335,11 @@ public sealed class Plugin : BaseUnityPlugin
                         guard => guard.GetFinalName()))));
             foreach (NeuralNPC guard in guards)
             {
+                pendingGuardIncidents[GetNpcKey(guard)] = new GuardIncident
+                {
+                    callerName = caller.GetFinalName(),
+                    reason = reason
+                };
                 string activity = "responding to " + caller.GetFinalName()
                     + " calling the guards because " + Player.Instance.playerName
                     + " " + reason;
@@ -346,11 +358,7 @@ public sealed class Plugin : BaseUnityPlugin
             AnimationHelper.Instance.SpawnFloatingText(
                 "<color=\"red\">Called the guards!</color>",
                 caller.transform);
-            NeuralNPC.AddGlobalMemory(
-                caller.GetFinalName() + " called the guards on "
-                + Player.Instance.playerName + " because "
-                + Player.Instance.playerName + " " + reason + ".",
-                npc => npc != caller && npc.faction == Faction.Silverpine);
+            SuppressJusticeDialogRumors(caller);
             DialogBox.Instance.QueueDialogEnd();
         }
         catch (Exception exception)
@@ -501,6 +509,10 @@ public sealed class Plugin : BaseUnityPlugin
         guard.AddThingThatHappened(
             Player.Instance.playerName + " paid a " + amount
             + " gold fine and was released by " + guard.GetFinalName() + ".");
+        PublishPlayerJusticeOutcome(
+            guard,
+            "was fined " + amount + " gold");
+        SuppressJusticeDialogRumors(guard);
         StopOtherGuardResponses(guard);
         CompleteJusticePrompt();
         DialogBox.Instance.QueueDialogEnd();
@@ -586,6 +598,8 @@ public sealed class Plugin : BaseUnityPlugin
         Log.LogInfo(
             guard.GetFinalName()
             + " released the player without a fine after the guard dialogue.");
+        pendingGuardIncidents.Remove(GetNpcKey(guard));
+        SuppressJusticeDialogRumors(guard);
         StopOtherGuardResponses(guard);
         CompleteJusticePrompt();
         DialogBox.Instance.QueueDialogEnd();
@@ -647,40 +661,107 @@ public sealed class Plugin : BaseUnityPlugin
 
     internal bool IsJailReady(out string reason)
     {
+        return TryGetAvailableJailCell(out _, out reason);
+    }
+
+    private bool TryGetAvailableJailCell(
+        out JailCellSave cell,
+        out string reason)
+    {
+        cell = null!;
         reason = "";
         if (currentSave == null)
         {
             reason = "No loaded save is active.";
             return false;
         }
-        if (currentSave.jailDoorKeys.Count == 0)
+        if (currentSave.jailCells.Count == 0)
         {
-            reason = "No jail doors are designated.";
-            return false;
-        }
-        if (!currentSave.hasJailCell)
-        {
-            reason = "No jail destination tile is selected.";
+            reason = "No jail cells are configured.";
             return false;
         }
 
-        Vector2Int cell = new(currentSave.jailCellX, currentSave.jailCellY);
-        if (!Turfs.IsValidTurf(cell))
+        IEnumerable<JailCellSave> ordered = currentSave.jailCells
+            .OrderBy(candidate =>
+                string.Equals(
+                    candidate.id,
+                    currentSave.selectedJailCellId,
+                    StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : 1);
+        foreach (JailCellSave candidate in ordered)
         {
-            reason = "The selected jail tile is not currently loaded.";
+            if (IsCellConfigured(candidate, out _)
+                && !IsCellOccupied(candidate))
+            {
+                cell = candidate;
+                return true;
+            }
+        }
+
+        JailCellSave selected = GetSelectedJailCell()
+            ?? currentSave.jailCells[0];
+        if (!IsCellConfigured(selected, out reason))
+            return false;
+
+        reason = "Every configured jail cell is currently occupied.";
+        return false;
+    }
+
+    private bool IsCellConfigured(JailCellSave cell, out string reason)
+    {
+        reason = "";
+        if (!cell.hasDestination)
+        {
+            reason = cell.name + " has no destination tile.";
             return false;
         }
-        if (TurfCollider.HasImpassableCollider(cell))
+        if (cell.doorKeys.Count == 0)
         {
-            reason = "The selected jail tile is blocked.";
+            reason = cell.name + " has no connected jail doors.";
             return false;
         }
-        if (GetConfiguredLoadedDoors().Count == 0)
+
+        Vector2Int destination = new(cell.destinationX, cell.destinationY);
+        if (!Turfs.IsValidTurf(destination))
         {
-            reason = "No designated jail door is currently loaded.";
+            reason = cell.name + " is not currently loaded.";
+            return false;
+        }
+        if (TurfCollider.HasImpassableCollider(destination))
+        {
+            reason = cell.name + " has a blocked destination tile.";
+            return false;
+        }
+        if (GetConfiguredLoadedDoors(cell).Count == 0)
+        {
+            reason = cell.name + " has no connected door currently loaded.";
             return false;
         }
         return true;
+    }
+
+    private bool IsCellOccupied(JailCellSave cell)
+    {
+        if (currentSave == null || WorldInfoManager.Instance == null)
+            return false;
+
+        int turn = WorldInfoManager.Instance.TotalTurnCount;
+        if (currentSave.playerReleaseTurn > turn
+            && string.Equals(
+                currentSave.playerSentenceCellId,
+                cell.id,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return currentSave.npcSentences.Any(sentence =>
+            sentence.releaseTurn > turn
+            && string.Equals(
+                sentence.cellId,
+                cell.id,
+                StringComparison.OrdinalIgnoreCase));
     }
 
     internal void AcceptJail(
@@ -694,25 +775,32 @@ public sealed class Plugin : BaseUnityPlugin
             return;
         }
 
-        if (!IsJailReady(out string reason))
+        if (currentSave.playerReleaseTurn
+            > WorldInfoManager.Instance.TotalTurnCount)
+        {
+            UpperNotificationUI.Instance.OneOff(
+                "You are already serving a jail sentence.");
+            return;
+        }
+
+        if (!TryGetAvailableJailCell(out JailCellSave cell, out string reason))
         {
             UpperNotificationUI.Instance.OneOff(reason);
             return;
         }
 
-        Vector2Int destination = new(
-            currentSave.jailCellX,
-            currentSave.jailCellY);
+        Vector2Int destination = new(cell.destinationX, cell.destinationY);
         int fineAmount = activeJusticePrompt != null
             ? activePromptFineAmount
             : FineAmount;
         int sentenceHours = GetSentenceHours(fineAmount);
         int sentenceTurns = sentenceHours * WorldInfoManager.HOUR_TURN_LENGTH;
-        currentSave.releaseTurn =
+        currentSave.playerReleaseTurn =
             WorldInfoManager.Instance.TotalTurnCount + sentenceTurns;
-        currentSave.pendingReleaseDoorKeys.Clear();
+        currentSave.playerSentenceCellId = cell.id;
+        cell.pendingReleaseDoorKeys.Clear();
         Player.Instance.entityMover.Teleport(destination);
-        CloseAndLockConfiguredDoors();
+        CloseAndLockCellDoors(cell);
         guard.AddThingThatHappened(
             Player.Instance.playerName
             + (forcedByInsufficientFunds
@@ -723,6 +811,10 @@ public sealed class Plugin : BaseUnityPlugin
             + (forcedByInsufficientFunds
                 ? "."
                 : " instead of paying the " + fineAmount + " gold fine."));
+        PublishPlayerJusticeOutcome(
+            guard,
+            "was jailed for " + sentenceHours + " game hours");
+        SuppressJusticeDialogRumors(guard);
         StopOtherGuardResponses(guard);
         CompleteJusticePrompt();
         SaveDatabase();
@@ -740,18 +832,29 @@ public sealed class Plugin : BaseUnityPlugin
     internal bool IsJailDoorLockedDown(Door door)
     {
         RefreshSaveIdentity();
-        if (currentSave == null || currentSave.releaseTurn < 0)
+        if (currentSave == null)
             return false;
 
-        if (WorldInfoManager.Instance != null
-            && WorldInfoManager.Instance.TotalTurnCount
-                >= currentSave.releaseTurn)
-        {
-            ReleasePrisoner();
-            return false;
-        }
+        string key = GetDoorKey(door);
+        JailCellSave? cell = currentSave.jailCells.FirstOrDefault(
+            candidate => Contains(candidate.doorKeys, key));
+        return cell != null && IsCellOccupied(cell);
+    }
 
-        return Contains(currentSave.jailDoorKeys, GetDoorKey(door));
+    internal bool CanPlayerGuardOperateJailDoor(
+        Door door,
+        GameObject caller)
+    {
+        return PlayerIsGuard
+            && Player.Instance != null
+            && caller == Player.Instance.gameObject
+            && IsJailDoorLockedDown(door);
+    }
+
+    internal void MarkPlayerGuardOpenedJailDoor(Door door)
+    {
+        if (door.IsOpen && IsJailDoorLockedDown(door))
+            playerGuardOpenedJailDoorKeys.Add(GetDoorKey(door));
     }
 
     private void MaintainSentence()
@@ -759,41 +862,64 @@ public sealed class Plugin : BaseUnityPlugin
         if (currentSave == null || WorldInfoManager.Instance == null)
             return;
 
-        if (currentSave.releaseTurn >= 0)
+        int turn = WorldInfoManager.Instance.TotalTurnCount;
+        if (currentSave.playerReleaseTurn >= 0
+            && turn >= currentSave.playerReleaseTurn)
         {
-            if (WorldInfoManager.Instance.TotalTurnCount
-                >= currentSave.releaseTurn)
-            {
-                ReleasePrisoner();
-            }
-            else
-            {
-                CloseAndLockConfiguredDoors();
-            }
+            ReleasePlayerPrisoner();
         }
+
+        foreach (NpcSentenceSave sentence in currentSave.npcSentences.ToList())
+        {
+            if (turn >= sentence.releaseTurn)
+                ReleaseNpcPrisoner(sentence);
+            else
+                EnsureNpcJailRoutine(sentence);
+        }
+
+        foreach (JailCellSave cell in currentSave.jailCells
+                     .Where(IsCellOccupied))
+            CloseAndLockCellDoors(
+                cell,
+                preservePlayerGuardOpenedDoor: true);
+
         ApplyPendingDoorReleases();
     }
 
-    private void ReleasePrisoner()
+    private void ReleasePlayerPrisoner()
     {
         if (currentSave == null)
             return;
 
-        currentSave.releaseTurn = -1;
-        currentSave.pendingReleaseDoorKeys =
-            new List<string>(currentSave.jailDoorKeys);
+        JailCellSave? cell = GetCell(currentSave.playerSentenceCellId);
+        currentSave.playerReleaseTurn = -1;
+        currentSave.playerSentenceCellId = "";
+        if (cell != null)
+            AddPendingDoorReleases(cell);
         ApplyPendingDoorReleases();
         SaveDatabase();
         UpperNotificationUI.Instance?.OneOff(
             "Your sentence is complete. The jail is open.");
     }
 
-    private void CloseAndLockConfiguredDoors()
+    private void CloseAndLockCellDoors(
+        JailCellSave cell,
+        bool preservePlayerGuardOpenedDoor = false)
     {
-        foreach (Door door in GetConfiguredLoadedDoors())
+        foreach (Door door in GetConfiguredLoadedDoors(cell))
         {
             try
             {
+                string key = GetDoorKey(door);
+                if (preservePlayerGuardOpenedDoor
+                    && door.IsOpen
+                    && playerGuardOpenedJailDoorKeys.Contains(key))
+                {
+                    door.isLocked = true;
+                    continue;
+                }
+
+                playerGuardOpenedJailDoorKeys.Remove(key);
                 DoorCloseMethod.Invoke(
                     door,
                     new object[] { door.gameObject, true });
@@ -810,31 +936,44 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void ApplyPendingDoorReleases()
     {
-        if (currentSave == null
-            || currentSave.pendingReleaseDoorKeys.Count == 0)
-        {
+        if (currentSave == null)
             return;
-        }
 
-        List<string> pending =
-            new(currentSave.pendingReleaseDoorKeys);
-        HashSet<string> released =
-            new(StringComparer.OrdinalIgnoreCase);
-        foreach (Door door in Door.allDoors.Where(door => door != null).ToList())
+        bool changed = false;
+        foreach (JailCellSave cell in currentSave.jailCells)
         {
-            string key = GetDoorKey(door);
-            if (!Contains(pending, key))
+            if (cell.pendingReleaseDoorKeys.Count == 0
+                || IsCellOccupied(cell))
+            {
                 continue;
+            }
 
-            UnlockAndOpenDoor(door);
-            released.Add(key);
+            List<string> pending = new(cell.pendingReleaseDoorKeys);
+            foreach (Door door in Door.allDoors
+                         .Where(door => door != null)
+                         .ToList())
+            {
+                string key = GetDoorKey(door);
+                if (!Contains(pending, key))
+                    continue;
+
+                playerGuardOpenedJailDoorKeys.Remove(key);
+                UnlockAndOpenDoor(door);
+                changed |= Remove(cell.pendingReleaseDoorKeys, key);
+            }
         }
 
-        foreach (string key in released)
-            Remove(currentSave.pendingReleaseDoorKeys, key);
-
-        if (currentSave.pendingReleaseDoorKeys.Count == 0)
+        if (changed)
             SaveDatabase();
+    }
+
+    private static void AddPendingDoorReleases(JailCellSave cell)
+    {
+        foreach (string key in cell.doorKeys)
+        {
+            if (!Contains(cell.pendingReleaseDoorKeys, key))
+                cell.pendingReleaseDoorKeys.Add(key);
+        }
     }
 
     private static void UnlockAndOpenDoor(Door door)
@@ -859,7 +998,7 @@ public sealed class Plugin : BaseUnityPlugin
         get
         {
             if (currentSave == null
-                || currentSave.releaseTurn < 0
+                || currentSave.playerReleaseTurn < 0
                 || WorldInfoManager.Instance == null)
             {
                 return 0;
@@ -867,7 +1006,7 @@ public sealed class Plugin : BaseUnityPlugin
 
             int turns = Math.Max(
                 0,
-                currentSave.releaseTurn
+                currentSave.playerReleaseTurn
                     - WorldInfoManager.Instance.TotalTurnCount);
             return Mathf.CeilToInt(
                 turns / (float)WorldInfoManager.HOUR_TURN_LENGTH);
@@ -877,64 +1016,182 @@ public sealed class Plugin : BaseUnityPlugin
     internal bool IsJailDoor(Door door)
     {
         return currentSave != null
-            && Contains(currentSave.jailDoorKeys, GetDoorKey(door));
+            && currentSave.jailCells.Any(cell =>
+                Contains(cell.doorKeys, GetDoorKey(door)));
     }
 
-    internal int JailDoorCount => currentSave?.jailDoorKeys.Count ?? 0;
+    internal int JailDoorCount => currentSave?.jailCells
+        .SelectMany(cell => cell.doorKeys)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Count() ?? 0;
 
-    internal void ToggleJailDoor(Door door)
+    internal int JailCellCount => currentSave?.jailCells.Count ?? 0;
+
+    internal int NpcPrisonerCount => currentSave?.npcSentences.Count ?? 0;
+
+    internal string SelectedJailCellLabel =>
+        GetSelectedJailCell()?.name ?? "none";
+
+    internal void AddJailCell()
     {
         RefreshSaveIdentity();
         if (currentSave == null)
             return;
 
-        string key = GetDoorKey(door);
-        if (Remove(currentSave.jailDoorKeys, key))
+        int cellNumber = 1;
+        while (currentSave.jailCells.Any(existing => string.Equals(
+            existing.name,
+            "Cell " + cellNumber,
+            StringComparison.OrdinalIgnoreCase)))
         {
-            Remove(currentSave.pendingReleaseDoorKeys, key);
-            UnlockAndOpenDoor(door);
+            cellNumber++;
         }
-        else
+
+        JailCellSave cell = new()
         {
-            currentSave.jailDoorKeys.Add(key);
-            if (currentSave.releaseTurn >= 0)
-                CloseAndLockConfiguredDoors();
-        }
+            id = Guid.NewGuid().ToString("N"),
+            name = "Cell " + cellNumber
+        };
+        currentSave.jailCells.Add(cell);
+        currentSave.selectedJailCellId = cell.id;
         SaveDatabase();
+    }
+
+    internal void SelectNextJailCell()
+    {
+        RefreshSaveIdentity();
+        if (currentSave == null || currentSave.jailCells.Count == 0)
+            return;
+
+        int index = currentSave.jailCells.FindIndex(cell =>
+            string.Equals(
+                cell.id,
+                currentSave.selectedJailCellId,
+                StringComparison.OrdinalIgnoreCase));
+        index = (index + 1) % currentSave.jailCells.Count;
+        currentSave.selectedJailCellId = currentSave.jailCells[index].id;
+        SaveDatabase();
+    }
+
+    internal bool RemoveSelectedJailCell(out string reason)
+    {
+        reason = "";
+        RefreshSaveIdentity();
+        JailCellSave? cell = GetSelectedJailCell();
+        if (currentSave == null || cell == null)
+        {
+            reason = "No jail cell is selected.";
+            return false;
+        }
+        if (IsCellOccupied(cell))
+        {
+            reason = cell.name + " cannot be removed while occupied.";
+            return false;
+        }
+
+        List<Door> loadedDoors = GetConfiguredLoadedDoors(cell);
+        if (loadedDoors.Count < cell.doorKeys.Count)
+        {
+            reason = "Load every door connected to " + cell.name
+                + " before removing it, so each door can be unlocked safely.";
+            return false;
+        }
+
+        foreach (Door door in loadedDoors)
+            UnlockAndOpenDoor(door);
+        currentSave.jailCells.Remove(cell);
+        currentSave.selectedJailCellId =
+            currentSave.jailCells.FirstOrDefault()?.id ?? "";
+        SaveDatabase();
+        return true;
+    }
+
+    internal string ToggleJailDoor(Door door)
+    {
+        RefreshSaveIdentity();
+        JailCellSave? selected = GetSelectedJailCell();
+        if (currentSave == null || selected == null)
+            return "Add or select a jail cell first.";
+
+        string key = GetDoorKey(door);
+        JailCellSave? owner = currentSave.jailCells.FirstOrDefault(cell =>
+            Contains(cell.doorKeys, key));
+        if (owner != null && IsCellOccupied(owner))
+            return owner.name + " is occupied; its doors cannot be reassigned.";
+
+        if (owner == selected)
+        {
+            Remove(selected.doorKeys, key);
+            Remove(selected.pendingReleaseDoorKeys, key);
+            UnlockAndOpenDoor(door);
+            SaveDatabase();
+            return GetDoorDisplayName(door) + " was disconnected from "
+                + selected.name + ".";
+        }
+
+        if (owner != null)
+        {
+            Remove(owner.doorKeys, key);
+            Remove(owner.pendingReleaseDoorKeys, key);
+        }
+        selected.doorKeys.Add(key);
+        if (IsCellOccupied(selected))
+            CloseAndLockCellDoors(selected);
+        SaveDatabase();
+        return GetDoorDisplayName(door) + " is now connected to "
+            + selected.name + ".";
     }
 
     internal void SetJailCell(Vector2Int position)
     {
         RefreshSaveIdentity();
+        JailCellSave? cell = GetSelectedJailCell();
         if (currentSave == null)
             return;
+        if (cell == null)
+        {
+            AddJailCell();
+            cell = GetSelectedJailCell();
+        }
+        if (cell == null)
+            return;
 
-        currentSave.hasJailCell = true;
-        currentSave.jailCellX = position.x;
-        currentSave.jailCellY = position.y;
+        cell.hasDestination = true;
+        cell.destinationX = position.x;
+        cell.destinationY = position.y;
         SaveDatabase();
     }
 
     internal bool TryGetJailCell(out Vector2Int position)
     {
         position = default;
-        if (currentSave == null || !currentSave.hasJailCell)
+        JailCellSave? cell = GetSelectedJailCell();
+        if (cell == null || !cell.hasDestination)
             return false;
 
-        position = new Vector2Int(
-            currentSave.jailCellX,
-            currentSave.jailCellY);
+        position = new Vector2Int(cell.destinationX, cell.destinationY);
         return true;
     }
 
-    private List<Door> GetConfiguredLoadedDoors()
+    private JailCellSave? GetSelectedJailCell()
     {
         if (currentSave == null)
-            return new List<Door>();
+            return null;
+        return GetCell(currentSave.selectedJailCellId)
+            ?? currentSave.jailCells.FirstOrDefault();
+    }
 
+    private JailCellSave? GetCell(string id)
+    {
+        return currentSave?.jailCells.FirstOrDefault(cell =>
+            string.Equals(cell.id, id, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private List<Door> GetConfiguredLoadedDoors(JailCellSave cell)
+    {
         return Door.allDoors
             .Where(door => door != null
-                && Contains(currentSave.jailDoorKeys, GetDoorKey(door)))
+                && Contains(cell.doorKeys, GetDoorKey(door)))
             .ToList();
     }
 
@@ -994,12 +1251,108 @@ public sealed class Plugin : BaseUnityPlugin
             database = JsonConvert.DeserializeObject<GuardDatabase>(
                 File.ReadAllText(DatabasePath)) ?? new GuardDatabase();
             database.Normalize();
+            PruneLegacyMainMenuEntries();
         }
         catch (Exception exception)
         {
             database = new GuardDatabase();
             Log.LogError("Could not load guard configuration: " + exception);
         }
+    }
+
+    private void PruneLegacyMainMenuEntries()
+    {
+        if (database.menuEntryCleanupVersion >= 1)
+            return;
+
+        string saveDirectory = Path.Combine(
+            Application.persistentDataPath,
+            "Saves");
+        if (!Directory.Exists(saveDirectory))
+            return;
+
+        List<string> candidates = database.saves
+            .Where(pair => pair.Value.IsUntouchedDefault())
+            .Select(pair => pair.Key)
+            .ToList();
+        HashSet<string> realRunIds =
+            new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, byte[]> needles = candidates.ToDictionary(
+            id => id,
+            Encoding.ASCII.GetBytes,
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (string file in Directory.EnumerateFiles(saveDirectory)
+                     .Where(path =>
+                         string.Equals(
+                             Path.GetExtension(path),
+                             ".sav",
+                             StringComparison.OrdinalIgnoreCase)
+                         || string.Equals(
+                             Path.GetExtension(path),
+                             ".savmeta",
+                             StringComparison.OrdinalIgnoreCase)))
+        {
+            byte[] bytes;
+            try
+            {
+                bytes = File.ReadAllBytes(file);
+            }
+            catch (Exception exception)
+            {
+                Log.LogWarning(
+                    "Could not inspect save while cleaning old menu entries: "
+                    + exception.Message);
+                return;
+            }
+
+            foreach (string id in candidates)
+            {
+                if (!realRunIds.Contains(id)
+                    && ContainsBytes(bytes, needles[id]))
+                {
+                    realRunIds.Add(id);
+                }
+            }
+        }
+
+        int removed = 0;
+        foreach (string id in candidates.Where(id => !realRunIds.Contains(id)))
+        {
+            if (database.saves.Remove(id))
+                removed++;
+        }
+
+        database.menuEntryCleanupVersion = 1;
+        SaveDatabase();
+        if (removed > 0)
+        {
+            Log.LogInfo(
+                "Removed " + removed
+                + " legacy default-only main-menu guard configurations.");
+        }
+    }
+
+    private static bool ContainsBytes(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0 || haystack.Length < needle.Length)
+            return false;
+
+        for (int index = 0; index <= haystack.Length - needle.Length; index++)
+        {
+            if (haystack[index] != needle[0])
+                continue;
+
+            int offset = 1;
+            while (offset < needle.Length
+                && haystack[index + offset] == needle[offset])
+            {
+                offset++;
+            }
+            if (offset == needle.Length)
+                return true;
+        }
+        return false;
     }
 
     private void SaveDatabase()
@@ -1176,12 +1529,19 @@ internal static class JailDoorInteractionLockdownPatch
             return true;
         }
 
+        if (Plugin.Instance.CanPlayerGuardOperateJailDoor(
+                __instance,
+                caller))
+        {
+            return true;
+        }
+
         if (Player.Instance != null
             && caller == Player.Instance.gameObject
             && DialogBox.Instance != null)
         {
             DialogBox.Instance.DisplayTextNoDialog(
-                "The jail door is locked until your sentence is complete.");
+                "This jail cell is locked until its sentence is complete.");
         }
         return false;
     }
@@ -1191,15 +1551,87 @@ internal static class JailDoorInteractionLockdownPatch
 internal static class JailDoorOpenLockdownPatch
 {
     [HarmonyPrefix]
-    private static bool BlockEveryOpenPathDuringSentence(Door __instance)
+    private static bool BlockEveryOpenPathDuringSentence(
+        Door __instance,
+        GameObject caller,
+        ref bool __state)
+    {
+        __state = false;
+        if (ReferenceEquals(Plugin.Instance, null)
+            || !Plugin.Instance.IsJailDoorLockedDown(__instance))
+        {
+            return true;
+        }
+
+        if (!Plugin.Instance.CanPlayerGuardOperateJailDoor(
+                __instance,
+                caller))
+        {
+            return false;
+        }
+
+        __state = true;
+        __instance.isLocked = false;
+        return true;
+    }
+
+    [HarmonyPostfix]
+    private static void RestoreGuardOpenedDoorLock(
+        Door __instance,
+        bool __state)
+    {
+        if (!__state || ReferenceEquals(Plugin.Instance, null))
+            return;
+
+        if (Plugin.Instance.IsJailDoorLockedDown(__instance))
+        {
+            __instance.isLocked = true;
+            Plugin.Instance.MarkPlayerGuardOpenedJailDoor(__instance);
+        }
+    }
+}
+
+[HarmonyPatch(typeof(Door), nameof(Door.OnSteppedOn))]
+internal static class PlayerGuardJailDoorAutoClosePatch
+{
+    [HarmonyPostfix]
+    private static void CloseAfterPlayerGuardPassesThrough(
+        Door __instance,
+        GameObject caller)
+    {
+        if (ReferenceEquals(Plugin.Instance, null)
+            || !__instance.IsOpen
+            || !Plugin.Instance.CanPlayerGuardOperateJailDoor(
+                __instance,
+                caller))
+        {
+            return;
+        }
+
+        __instance.MarkForClosing(1);
+    }
+}
+
+[HarmonyPatch(
+    typeof(NPCRoutineExecutor),
+    nameof(NPCRoutineExecutor.StartOverrideRoutine))]
+internal static class JailedNpcOverrideRoutinePatch
+{
+    [HarmonyPrefix]
+    private static bool HaltNewRoutinesWhileJailed(
+        NPCRoutineExecutor __instance,
+        NPCRoutine npcRoutine)
     {
         return ReferenceEquals(Plugin.Instance, null)
-            || !Plugin.Instance.IsJailDoorLockedDown(__instance);
+            || !Plugin.Instance.ShouldBlockNpcRoutineWhileJailed(
+                __instance,
+                npcRoutine);
     }
 }
 
 internal sealed class GuardDatabase
 {
+    public int menuEntryCleanupVersion;
     public Dictionary<string, GuardSave> saves =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -1215,10 +1647,18 @@ internal sealed class GuardDatabase
 internal sealed class GuardSave
 {
     public List<string> guardKeys = new();
+    public bool playerIsGuard;
+    public List<JailCellSave> jailCells = new();
+    public string selectedJailCellId = "";
+    public int playerReleaseTurn = -1;
+    public string playerSentenceCellId = "";
+    public List<NpcSentenceSave> npcSentences = new();
+
+    // Legacy single-cell fields retained only for automatic v1.0 migration.
     public List<string> jailDoorKeys = new();
     public bool hasJailCell;
-    public int jailCellX;
-    public int jailCellY;
+    public int jailCellX = 0;
+    public int jailCellY = 0;
     public bool useBaseGameFine = true;
     public int fineAmount = 100;
     public bool useFineBasedSentence = true;
@@ -1237,12 +1677,145 @@ internal sealed class GuardSave
     internal void Normalize()
     {
         guardKeys ??= new List<string>();
+        jailCells ??= new List<JailCellSave>();
+        npcSentences ??= new List<NpcSentenceSave>();
         jailDoorKeys ??= new List<string>();
         pendingReleaseDoorKeys ??= new List<string>();
+        selectedJailCellId ??= "";
+        playerSentenceCellId ??= "";
+
+        if (jailCells.Count == 0
+            && (hasJailCell
+                || jailDoorKeys.Count > 0
+                || pendingReleaseDoorKeys.Count > 0
+                || releaseTurn >= 0))
+        {
+            JailCellSave migrated = new()
+            {
+                id = "legacy-cell",
+                name = "Cell 1",
+                hasDestination = hasJailCell,
+                destinationX = jailCellX,
+                destinationY = jailCellY,
+                doorKeys = new List<string>(jailDoorKeys),
+                pendingReleaseDoorKeys =
+                    new List<string>(pendingReleaseDoorKeys)
+            };
+            jailCells.Add(migrated);
+            selectedJailCellId = migrated.id;
+            if (releaseTurn >= 0)
+            {
+                playerReleaseTurn = releaseTurn;
+                playerSentenceCellId = migrated.id;
+            }
+        }
+
+        for (int index = 0; index < jailCells.Count; index++)
+            jailCells[index].Normalize(index + 1);
+        HashSet<string> assignedDoors =
+            new(StringComparer.OrdinalIgnoreCase);
+        foreach (JailCellSave cell in jailCells)
+        {
+            cell.doorKeys.RemoveAll(key => !assignedDoors.Add(key));
+            cell.pendingReleaseDoorKeys.RemoveAll(key =>
+                !cell.doorKeys.Any(doorKey => string.Equals(
+                    doorKey,
+                    key,
+                    StringComparison.OrdinalIgnoreCase)));
+        }
+        npcSentences.RemoveAll(sentence => sentence == null);
+        foreach (NpcSentenceSave sentence in npcSentences)
+            sentence.Normalize();
+
+        if (jailCells.Count > 0
+            && !jailCells.Any(cell => string.Equals(
+                cell.id,
+                selectedJailCellId,
+                StringComparison.OrdinalIgnoreCase)))
+        {
+            selectedJailCellId = jailCells[0].id;
+        }
+
+        jailDoorKeys.Clear();
+        pendingReleaseDoorKeys.Clear();
+        hasJailCell = false;
+        releaseTurn = -1;
         fineAmount = Mathf.Clamp(fineAmount, 1, 1000);
         fixedSentenceHours = Mathf.Clamp(fixedSentenceHours, 1, 1000);
         goldPerJailHour = Mathf.Clamp(goldPerJailHour, 1, 1000);
     }
+
+    internal bool IsUntouchedDefault()
+    {
+        return guardKeys.Count == 1
+            && string.Equals(
+                guardKeys[0],
+                NPCName.Darian.ToString(),
+                StringComparison.OrdinalIgnoreCase)
+            && !playerIsGuard
+            && jailCells.Count == 0
+            && playerReleaseTurn < 0
+            && npcSentences.Count == 0
+            && useBaseGameFine
+            && fineAmount == 100
+            && useFineBasedSentence
+            && fixedSentenceHours == 24
+            && goldPerJailHour == 5;
+    }
+}
+
+internal sealed class JailCellSave
+{
+    public string id = "";
+    public string name = "";
+    public bool hasDestination;
+    public int destinationX;
+    public int destinationY;
+    public List<string> doorKeys = new();
+    public List<string> pendingReleaseDoorKeys = new();
+
+    internal void Normalize(int index)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            id = Guid.NewGuid().ToString("N");
+        if (string.IsNullOrWhiteSpace(name))
+            name = "Cell " + index;
+        doorKeys ??= new List<string>();
+        pendingReleaseDoorKeys ??= new List<string>();
+        doorKeys = doorKeys
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        pendingReleaseDoorKeys = pendingReleaseDoorKeys
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+}
+
+internal sealed class NpcSentenceSave
+{
+    public string npcKey = "";
+    public string npcName = "";
+    public string cellId = "";
+    public int releaseTurn = -1;
+    public int fineAmount;
+    public string law = "";
+
+    internal void Normalize()
+    {
+        npcKey ??= "";
+        npcName ??= "";
+        cellId ??= "";
+        law ??= "";
+        fineAmount = Mathf.Clamp(fineAmount, 0, 1000);
+    }
+}
+
+internal sealed class GuardIncident
+{
+    public string callerName = "";
+    public string reason = "";
 }
 
 [HarmonyPatch(typeof(NPCFunction_CallGuards), nameof(NPCFunction_CallGuards.IsAPIActive))]
@@ -1286,19 +1859,123 @@ internal static class GuardResolutionButtonsPatch
     private static void AddResolutionChoices(
         List<UpperButtonOption> upperButtonOptions)
     {
-        NeuralNPC guard = NeuralNPC.currentActiveDialogNeuralNPC;
-        if (guard == null || !Plugin.Instance.IsManagedGuardResponse(guard))
+        NeuralNPC target = NeuralNPC.currentActiveDialogNeuralNPC;
+        if (target == null)
             return;
 
-        if (!upperButtonOptions.Any(option =>
+        if (Plugin.Instance.IsManagedGuardResponse(target)
+            && !upperButtonOptions.Any(option =>
                 option.label.StartsWith(
                     "Resolve Fine or Jail",
                     StringComparison.Ordinal)))
         {
             upperButtonOptions.Add(new UpperButtonOption(
                 "Resolve Fine or Jail",
-                () => _ = Plugin.Instance.OfferFineOrJail(guard)));
+                () => _ = Plugin.Instance.OfferFineOrJail(target)));
         }
+
+        if (Plugin.Instance.HasPendingPlayerGuardAccusation)
+        {
+            if (Plugin.Instance.PendingPlayerGuardResponsesComplete
+                && !upperButtonOptions.Any(option =>
+                    option.label.StartsWith(
+                        "Guard: Decide Punishment",
+                        StringComparison.Ordinal)))
+            {
+                upperButtonOptions.Add(new UpperButtonOption(
+                    "Guard: Decide Punishment",
+                    Plugin.Instance.BeginPlayerGuardPunishmentDecision));
+            }
+            return;
+        }
+
+        IReadOnlyList<NeuralNPC> releaseCandidates =
+            Plugin.Instance.GetPlayerGuardEarlyReleaseCandidates(target);
+        foreach (NeuralNPC prisoner in releaseCandidates)
+        {
+            string label = releaseCandidates.Count == 1
+                ? "Guard: Release Prisoner Early"
+                : "Guard: Release " + prisoner.GetFinalName() + " Early";
+            if (upperButtonOptions.Any(option => string.Equals(
+                    option.label,
+                    label,
+                    StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            upperButtonOptions.Add(new UpperButtonOption(
+                label,
+                () => Plugin.Instance.ReleaseNpcPrisonerEarly(prisoner)));
+        }
+
+        if (Plugin.Instance.CanPlayerGuardActOn(target)
+            && !Plugin.Instance.IsPlayerGuardSetupActive
+            && !upperButtonOptions.Any(option =>
+                option.label.StartsWith(
+                    "Guard: Accuse",
+                    StringComparison.Ordinal)))
+        {
+            upperButtonOptions.Add(new UpperButtonOption(
+                "Guard: Accuse of Lawbreaking",
+                () => Plugin.Instance.BeginPlayerGuardJustice(target)));
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPriority(Priority.Last)]
+    private static void LockLeaveForPendingCase(DialogBox __instance)
+    {
+        if (!ReferenceEquals(Plugin.Instance, null))
+            Plugin.Instance.ApplyPendingPlayerGuardLeaveLock(__instance);
+    }
+}
+
+[HarmonyPatch(typeof(DialogBox), "Update")]
+internal static class PendingPlayerGuardLeaveLockPatch
+{
+    [HarmonyPostfix]
+    private static void KeepLeaveLocked(DialogBox __instance)
+    {
+        if (!ReferenceEquals(Plugin.Instance, null))
+            Plugin.Instance.ApplyPendingPlayerGuardLeaveLock(__instance);
+    }
+}
+
+[HarmonyPatch(typeof(NeuralNPC), nameof(NeuralNPC.GenerateRumor))]
+internal static class SuppressUnresolvedJusticeRumorPatch
+{
+    [HarmonyPrefix]
+    private static bool SuppressJusticeRumor(NeuralNPC __instance)
+    {
+        return ReferenceEquals(Plugin.Instance, null)
+            || !Plugin.Instance.IsJusticeDialogRumorSuppressed(__instance);
+    }
+}
+
+[HarmonyPatch(typeof(NeuralNPC), nameof(NeuralNPC.EndOfDialogCleanup))]
+internal static class SuppressJusticeConversationBroadcastPatch
+{
+    [HarmonyPrefix]
+    private static void SuppressConversationBroadcast(
+        NeuralNPC __instance,
+        ref bool broadcastConversation,
+        out bool __state)
+    {
+        __state = !ReferenceEquals(Plugin.Instance, null)
+            && Plugin.Instance.IsJusticeDialogRumorSuppressed(__instance);
+        if (__state)
+            broadcastConversation = false;
+    }
+
+    [HarmonyPostfix]
+    private static void ClearSuppression(NeuralNPC __instance, bool __state)
+    {
+        if (ReferenceEquals(Plugin.Instance, null))
+            return;
+        Plugin.Instance.ClearPlayerGuardLawEntry(__instance);
+        if (__state)
+            Plugin.Instance.ClearJusticeDialogRumorSuppression(__instance);
     }
 }
 
