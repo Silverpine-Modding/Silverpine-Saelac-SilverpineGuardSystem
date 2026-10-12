@@ -3,6 +3,30 @@
 `SilverpineGuardSystem` is a BepInEx plugin that expands Silverpine's built-in
 `NeuralNPC` `call_guards` function.
 
+Current version: **1.3.5**.
+
+Version 1.3.5 corrects witnessed-crime confirmation: a responder already handling
+another incident, or prevented from accepting the response routine, no longer
+reports success. A confirmed report requires an actually installed new response
+routine; failed reports create no pending incident or success notification.
+
+### Reporting witnessed crimes from other mods
+
+Version 1.3.4 adds the public, synchronous, main-thread API
+`Plugin.TryReportWitnessedCrime(NeuralNPC caller, string reason, Vector2Int incident)`.
+The reason completes the phrase "the player ...". In 1.3.5, it returns true only
+when a configured guard accepts a new response routine, then records the pending
+incident for the existing fine/jail/release flow. Busy guards keep their current
+incident and return false; rejected routines also return false without recording
+an incident or displaying a successful guard call. A guard witness may respond
+directly. It does not ask the
+dialogue model for a reason, end unrelated dialogue, or broadcast a crime rumor.
+The API respects the active save's guard roster and supported Silverpine area.
+
+Breaking and Entering has used this API for visible break-in attempts since
+1.1.0. Pair its 1.2.1 update with Guard System 1.3.5 for accurate confirmation of
+new reports. Other guard calls through dialogue retain their existing behavior.
+
 ## Features
 
 - Adds a large, resolution-aware **Guard & Jail Manager** to Modding Tools'

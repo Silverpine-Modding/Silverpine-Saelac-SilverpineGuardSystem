@@ -24,7 +24,7 @@ public sealed partial class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "renegadex.silverpine.guardsystem";
     public const string PluginName = "Silverpine Guard System";
-    public const string PluginVersion = "1.3.3";
+    public const string PluginVersion = "1.3.5";
 
     private static readonly FieldInfo RunIdField =
         AccessTools.Field(typeof(SaveUI), "runID");
